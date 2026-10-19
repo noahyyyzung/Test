@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hands</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; font-family: system-ui, sans-serif; }
+  #info {
+    position: fixed; left: 0; right: 0; top: 16px; text-align: center;
+    color: #c9d1e0; font-size: 14px; line-height: 1.6; pointer-events: none; padding: 0 16px;
+  }
+  #info small { color: #8b94a8; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="info">
+  Open on Meta Quest 3 and tap Enter VR. Hold your controllers.<br>
+  Trigger curls your index finger, grip curls the other three, and your thumb curls when it touches a button or stick.<br>
+  <small>If the hands look tilted or rotated: hold Y/B and move the stick to tilt or roll them, hold X/A and move the stick to turn them. Click both sticks to reset.</small>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// ---------- Settings you can tweak ----------
+const SKIN_COLOR = 0xd9a07f;      // change this hex for a different skin tone
+const SKIN_ROUGHNESS = 0.75;
+const HAND_SCALE = 1.0;           // 1.0 = average adult hand
+const HAND_MODEL_URL = 'https://cdn.jsdelivr.net/npm/@webxr-input-profiles/assets@1.0/dist/profiles/generic-hand/';
+
+// Max bend (degrees) at each finger joint when fully curled: knuckle, middle joint, fingertip joint
+const FINGER_MAX = [80, 100, 65];
+
+// ---------- Renderer ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+document.body.appendChild(renderer.domElement);
+
+// Controllers only: hand tracking is intentionally not requested.
+document.body.appendChild(VRButton.createButton(renderer, {
+  optionalFeatures: ['local-floor', 'bounded-floor']
+}));
+
+// ---------- Scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14171f);
+scene.fog = new THREE.Fog(0x14171f, 8, 22);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
+camera.position.set(0, 1.6, 0);
+
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x20232d, 1.1));
+
+const key = new THREE.DirectionalLight(0xfff2e0, 1.9);
+key.position.set(1.5, 4, 2);
+scene.add(key);
+
+const fill = new THREE.DirectionalLight(0x9db8ff, 0.7);
+fill.position.set(-2, 2, -1.5);
+scene.add(fill);
+
+const floor = new THREE.Mesh(
+  new THREE.CircleGeometry(12, 64),
+  new THREE.MeshStandardMaterial({ color: 0x1b1f2a, roughness: 0.95, metalness: 0 })
+);
+floor.rotation.x = -Math.PI / 2;
+scene.add(floor);
+
+const grid = new THREE.GridHelper(24, 48, 0x3a4256, 0x252a38);
+grid.position.y = 0.002;
+scene.add(grid);
+
+// ---------- Hand rig definition ----------
+// Bone names are the standard WebXR hand joint names used by the generic hand model.
+const FINGERS = ['index', 'middle', 'ring', 'pinky'].map((key) => {
+  const p = key + '-finger';
+  return {
+    key,
+    chain: [p + '-metacarpal', p + '-phalanx-proximal', p + '-phalanx-intermediate', p + '-phalanx-distal', p + '-tip']
+  };
+});
+const THUMB_CHAIN = ['thumb-metacarpal', 'thumb-phalanx-proximal', 'thumb-phalanx-distal', 'thumb-tip'];
+const ALL_JOINTS = ['wrist', ...THUMB_CHAIN, ...FINGERS.flatMap((f) => f.chain)];
+
+// Thumb bend steps: which joint, which kind of bend, how many degrees at full curl
+const THUMB_STEPS = [
+  { i: 0, kind: 'adduct', deg: 22 },
+  { i: 0, kind: 'flex',   deg: 10 },
+  { i: 1, kind: 'flex',   deg: 35 },
+  { i: 2, kind: 'flex',   deg: 40 }
+];
+
+const RAD = Math.PI / 180;
+const _q = new THREE.Quaternion();
+const _acc = new THREE.Quaternion();
+const _pivot = new THREE.Vector3();
+const _v = new THREE.Vector3();
+const _m = new THREE.Matrix4();
+const _pm = new THREE.Matrix4();
+const _local = new THREE.Matrix4();
+
+// ---------- Build a posable hand from the loaded model ----------
+function makeHand(handedness, gltf) {
+  const isRight = handedness === 'right';
+  const model = gltf.scene;
+  model.updateMatrixWorld(true);
+
+  const h = {
+    handedness, isRight,
+    bones: {}, rest: {}, posed: {}, names: [],
+    parentName: {}, parentRestInv: {},
+    fingers: [], thumb: null,
+    cur: { index: 0, middle: 0, ring: 0, pinky: 0, thumb: 0 },
+    orient: new THREE.Group(),   // user calibration lives here
+    root: new THREE.Group()
+  };
+
+  // Skin tone + no culling (skinned meshes can vanish if culled by bind-pose bounds)
+  model.traverse((o) => {
+    if (!o.isMesh) return;
+    o.frustumCulled = false;
+    const m = o.material.clone();
+    if (m.color) m.color.setHex(SKIN_COLOR);
+    if ('roughness' in m) m.roughness = SKIN_ROUGHNESS;
+    if ('metalness' in m) m.metalness = 0;
+    m.map = null;
+    m.needsUpdate = true;
+    o.material = m;
+  });
+
+  // Record the bind pose of every joint
+  for (const name of ALL_JOINTS) {
+    const b = model.getObjectByName(name);
+    if (!b) throw new Error('hand model is missing joint: ' + name);
+    const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+    b.matrixWorld.decompose(p, q, s);
+    h.bones[name] = b;
+    h.rest[name] = { p, q, s };
+    h.posed[name] = { p: p.clone(), q: q.clone() };
+    h.names.push(name);
+  }
+  for (const name of h.names) {
+    const par = h.bones[name].parent;
+    const parName = par && ALL_JOINTS.includes(par.name) ? par.name : null;
+    h.parentName[name] = parName;
+    h.parentRestInv[name] = par ? par.matrixWorld.clone().invert() : new THREE.Matrix4();
+  }
+
+  const R = h.rest;
+
+  // Hand directions from the bind pose
+  const wrist = R['wrist'].p;
+  const iP = R['index-finger-phalanx-proximal'].p;
+  const mP = R['middle-finger-phalanx-proximal'].p;
+  const pP = R['pinky-finger-phalanx-proximal'].p;
+
+  const fwd = mP.clone().sub(wrist).normalize();                  // wrist -> fingers
+  // Palm normal (pointing out of the palm). Which cross product gives that depends on the hand.
+  const a = iP.clone().sub(wrist), b = pP.clone().sub(wrist);
+  const palm = (isRight ? a.clone().cross(b) : b.clone().cross(a)).normalize();
+  palm.sub(fwd.clone().multiplyScalar(fwd.dot(palm))).normalize();
+
+  // Finger curl axes: bending toward the palm
+  for (const f of FINGERS) {
+    const d = R[f.chain[4]].p.clone().sub(R[f.chain[1]].p).normalize();
+    const n = palm.clone().sub(d.clone().multiplyScalar(d.dot(palm))).normalize();
+    h.fingers.push({ key: f.key, chain: f.chain, axis: d.clone().cross(n).normalize() });
+  }
+
+  // Thumb axes
+  {
+    const d = R[THUMB_CHAIN[3]].p.clone().sub(R[THUMB_CHAIN[1]].p).normalize();
+    const n = palm.clone().sub(d.clone().multiplyScalar(d.dot(palm))).normalize();
+    const dt = R[THUMB_CHAIN[1]].p.clone().sub(R[THUMB_CHAIN[0]].p).normalize();
+    h.thumb = {
+      flexAxis: d.clone().cross(n).normalize(),
+      adductAxis: dt.clone().cross(fwd).normalize()
+    };
+  }
+
+  // Orient the model into the controller's grip space:
+  // fingers point forward (-Z), thumb side up (+Y), palm faces inward (-X right hand, +X left hand)
+  const side = fwd.clone().cross(palm);
+  const modelBasis = new THREE.Matrix4().makeBasis(fwd, palm, side);
+  const hf = new THREE.Vector3(0, 0, -1);
+  const hn = new THREE.Vector3(isRight ? -1 : 1, 0, 0);
+  const hs = hf.clone().cross(hn);
+  const handBasis = new THREE.Matrix4().makeBasis(hf, hn, hs);
+  const rot = new THREE.Matrix4().multiplyMatrices(handBasis, modelBasis.clone().transpose());
+  const rotQ = new THREE.Quaternion().setFromRotationMatrix(rot);
+
+  const palmCenter = wrist.clone().add(mP).multiplyScalar(0.5);
+  h.root.quaternion.copy(rotQ);
+  h.root.scale.setScalar(HAND_SCALE);
+  h.root.position.copy(palmCenter.applyQuaternion(rotQ).multiplyScalar(-HAND_SCALE));
+
+  h.root.add(model);
+  h.orient.add(h.root);
+  return h;
+}
+
+// ---------- Pose the hand ----------
+function bendChain(h, chain, from, axis, angle) {
+  _q.setFromAxisAngle(axis, angle);
+  const P = h.posed;
+  _pivot.copy(P[chain[from]].p);
+  for (let j = from; j < chain.length; j++) {
+    const e = P[chain[j]];
+    if (j > from) e.p.sub(_pivot).applyQuaternion(_q).add(_pivot);
+    e.q.premultiply(_q);
+  }
+}
+
+function poseHand(h, c) {
+  const P = h.posed, R = h.rest;
+  for (const name of h.names) {
+    P[name].p.copy(R[name].p);
+    P[name].q.copy(R[name].q);
+  }
+
+  // Fingers
+  for (const f of h.fingers) {
+    const t = c[f.key];
+    for (let k = 1; k <= 3; k++) {
+      bendChain(h, f.chain, k, f.axis, FINGER_MAX[k - 1] * RAD * t);
+    }
+  }
+
+  // Thumb
+  _acc.identity();
+  for (const s of THUMB_STEPS) {
+    _v.copy(s.kind === 'adduct' ? h.thumb.adductAxis : h.thumb.flexAxis).applyQuaternion(_acc);
+    bendChain(h, THUMB_CHAIN, s.i, _v, s.deg * RAD * c.thumb);
+    _acc.premultiply(_q);
+  }
+
+  // Write back into the bones' local transforms
+  for (const name of h.names) {
+    _m.compose(P[name].p, P[name].q, R[name].s);
+    const pn = h.parentName[name];
+    if (pn) {
+      _pm.compose(P[pn].p, P[pn].q, R[pn].s).invert();
+    } else {
+      _pm.copy(h.parentRestInv[name]);
+    }
+    _local.multiplyMatrices(_pm, _m);
+    const bone = h.bones[name];
+    _local.decompose(bone.position, bone.quaternion, bone.scale);
+  }
+}
+
+// ---------- Controllers ----------
+const loader = new GLTFLoader();
+const info = document.getElementById('info');
+const slots = [0, 1].map((i) => {
+  const grip = renderer.xr.getControllerGrip(i);
+  scene.add(grip);
+  return { grip, input: null, hand: null, token: 0 };
+});
+
+function btn(gp, i) {
+  return (gp && gp.buttons[i]) || { value: 0, pressed: false, touched: false };
+}
+
+slots.forEach((slot) => {
+  slot.grip.addEventListener('connected', (e) => {
+    const src = e.data;
+    // Tracked hands are not wanted here; only controllers drive the hands.
+    if (!src || src.hand || !src.gamepad) {
+      slot.input = null;
+      if (slot.hand) slot.hand.orient.visible = false;
+      return;
+    }
+    slot.input = src;
+    const hd = src.handedness;
+    if (hd !== 'left' && hd !== 'right') return;
+
+    if (slot.hand && slot.hand.handedness === hd) {
+      slot.hand.orient.visible = true;
+      return;
+    }
+    if (slot.hand) {
+      slot.grip.remove(slot.hand.orient);
+      slot.hand = null;
+    }
+    const token = ++slot.token;
+    loader.load(
+      HAND_MODEL_URL + hd + '.glb',
+      (gltf) => {
+        if (token !== slot.token) return;
+        try {
+          slot.hand = makeHand(hd, gltf);
+          slot.grip.add(slot.hand.orient);
+        } catch (err) {
+          console.error(err);
+        }
+      },
+      undefined,
+      (err) => console.error('Could not load hand model', err)
+    );
+  });
+
+  slot.grip.addEventListener('disconnected', () => {
+    slot.input = null;
+    if (slot.hand) slot.hand.orient.visible = false;
+  });
+});
+
+// ---------- Alignment tweaks (saved on the headset) ----------
+const CALIB_KEY = 'hands-calibration-v1';
+let calib = { pitch: 0, yaw: 0, roll: 0 };
+try {
+  const saved = JSON.parse(localStorage.getItem(CALIB_KEY));
+  if (saved && typeof saved.pitch === 'number') calib = saved;
+} catch (e) { /* storage unavailable, defaults are fine */ }
+
+let calibDirty = false;
+let resetLatch = false;
+
+function stickOf(gp) {
+  return gp.axes.length >= 4 ? [gp.axes[2], gp.axes[3]] : [gp.axes[0] || 0, gp.axes[1] || 0];
+}
+const dead = (v) => (Math.abs(v) < 0.2 ? 0 : v);
+
+function updateCalibration(dt) {
+  let editing = false;
+  let sticksDown = 0;
+  for (const slot of slots) {
+    const gp = slot.input && slot.input.gamepad;
+    if (!gp) continue;
+    if (btn(gp, 3).pressed) sticksDown++;
+    const [sx, sy] = stickOf(gp);
+    if (btn(gp, 5).pressed) {            // Y / B: tilt and roll
+      calib.roll += dead(sx) * 60 * dt;
+      calib.pitch += -dead(sy) * 60 * dt;
+      editing = true;
+    } else if (btn(gp, 4).pressed) {     // X / A: turn
+      calib.yaw += dead(sx) * 60 * dt;
+      editing = true;
+    }
+  }
+  if (sticksDown >= 2) {
+    if (!resetLatch) { calib = { pitch: 0, yaw: 0, roll: 0 }; calibDirty = true; }
+    resetLatch = true;
+  } else {
+    resetLatch = false;
+  }
+  if (editing) calibDirty = true;
+  else if (calibDirty) {
+    try { localStorage.setItem(CALIB_KEY, JSON.stringify(calib)); } catch (e) { /* ignore */ }
+    calibDirty = false;
+  }
+}
+
+// ---------- Per-frame ----------
+function targetsFrom(gp) {
+  const trigger = btn(gp, 0), squeeze = btn(gp, 1);
+  const thumbParts = [btn(gp, 3), btn(gp, 4), btn(gp, 5), btn(gp, 6)];
+  const touching = thumbParts.some((b) => b.touched || b.pressed);
+  const pressing = thumbParts.some((b) => b.pressed);
+
+  const idx = Math.max(0.12 + 0.88 * trigger.value, trigger.touched ? 0.35 : 0);
+  const grab = squeeze.value;
+  return {
+    index: idx,
+    middle: 0.18 + 0.82 * grab,
+    ring: 0.22 + 0.78 * grab,
+    pinky: 0.26 + 0.74 * grab,
+    thumb: pressing ? 1 : touching ? 0.75 : 0.1
+  };
+}
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  updateCalibration(dt);
+
+  const k = 1 - Math.exp(-dt * 20);
+  for (const slot of slots) {
+    const h = slot.hand;
+    if (!h || !slot.input) continue;
+
+    const t = targetsFrom(slot.input.gamepad);
+    for (const key in t) h.cur[key] += (t[key] - h.cur[key]) * k;
+    poseHand(h, h.cur);
+
+    const m = h.isRight ? 1 : -1;  // mirror yaw and roll for the left hand
+    h.orient.rotation.set(calib.pitch * RAD, m * calib.yaw * RAD, m * calib.roll * RAD, 'YXZ');
+  }
+
+  renderer.render(scene, camera);
+});
+
+renderer.xr.addEventListener('sessionstart', () => { info.style.display = 'none'; });
+renderer.xr.addEventListener('sessionend', () => { info.style.display = 'block'; });
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
